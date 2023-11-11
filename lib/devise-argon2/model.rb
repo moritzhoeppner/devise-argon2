@@ -6,31 +6,33 @@ module Devise
       def valid_password?(password)
         is_valid = hash_needs_update = false
         
-        if ::Argon2::Password.valid_hash?(encrypted_password)
-          if migrate_hash_from_devise_argon2_v1?
-            is_valid = ::Argon2::Password.verify_password(
-              "#{password}#{password_salt}#{self.class.pepper}",
-              encrypted_password
-            )
-            hash_needs_update = true
+        execute_in_at_least(self.class.argon2_options[:min_hashing_time]) do
+          if ::Argon2::Password.valid_hash?(encrypted_password)
+            if migrate_hash_from_devise_argon2_v1?
+              is_valid = ::Argon2::Password.verify_password(
+                "#{password}#{password_salt}#{self.class.pepper}",
+                encrypted_password
+              )
+              hash_needs_update = true
+            else
+              argon2_secret = (self.class.argon2_options[:secret] || self.class.pepper)
+              is_valid = ::Argon2::Password.verify_password(
+                password,
+                encrypted_password,
+                argon2_secret
+              )
+              hash_needs_update = outdated_work_factors?
+            end
           else
-            argon2_secret = (self.class.argon2_options[:secret] || self.class.pepper)
-            is_valid = ::Argon2::Password.verify_password(
-              password,
-              encrypted_password,
-              argon2_secret
-            )
-            hash_needs_update = outdated_work_factors?
+            # Devise models are included in a fixed order, see
+            # https://github.com/heartcombo/devise/blob/f6e73e5b5c8f519f4be29ac9069c6ed8a2343ce4/lib/devise/models.rb#L79.
+            # Since we don't specify where this model should be inserted when we call add_module,
+            # it will be inserted at the end, i.e. after DatabaseAuthenticatable (see
+            # https://github.com/heartcombo/devise/blob/f6e73e5b5c8f519f4be29ac9069c6ed8a2343ce4/lib/devise.rb#L393). 
+            # So we can call DatabaseAuthenticable's valid_password? with super.
+            is_valid = super
+            hash_needs_update = true
           end
-        else
-          # Devise models are included in a fixed order, see
-          # https://github.com/heartcombo/devise/blob/f6e73e5b5c8f519f4be29ac9069c6ed8a2343ce4/lib/devise/models.rb#L79.
-          # Since we don't specify where this model should be inserted when we call add_module,
-          # it will be inserted at the end, i.e. after DatabaseAuthenticatable (see
-          # https://github.com/heartcombo/devise/blob/f6e73e5b5c8f519f4be29ac9069c6ed8a2343ce4/lib/devise.rb#L393). 
-          # So we can call DatabaseAuthenticable's valid_password? with super.
-          is_valid = super
-          hash_needs_update = true
         end
 
         update_hash(password) if is_valid && hash_needs_update
@@ -41,13 +43,28 @@ module Devise
       protected
 
       def password_digest(password)
-        hasher_options = self.class.argon2_options.except(:migrate_from_devise_argon2_v1)
+        hasher_options = self.class.argon2_options.except(
+          :migrate_from_devise_argon2_v1,
+          :min_hashing_time
+        )
         hasher_options[:secret] ||= self.class.pepper
         hasher = ::Argon2::Password.new(hasher_options)
-        hasher.create(password)
+        execute_in_at_least(self.class.argon2_options[:min_hashing_time]) do
+          hasher.create(password)
+        end
       end
 
       private
+
+      def execute_in_at_least(min_seconds, &block)
+        start_time = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+        result = yield
+        if min_seconds
+          while Process.clock_gettime(Process::CLOCK_MONOTONIC) - start_time < min_seconds
+          end
+        end
+        result
+      end
 
       def update_hash(password)
         attributes = { encrypted_password: password_digest(password) }
@@ -95,6 +112,14 @@ module Devise
 
       module ClassMethods
         Devise::Models.config(self, :argon2_options)
+
+        def set_min_hashing_time
+          resource = self.new
+          start_time = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+          resource.password = 'password'
+          min_hashing_time = Process.clock_gettime(Process::CLOCK_MONOTONIC) - start_time
+          self.argon2_options[:min_hashing_time] = min_hashing_time
+        end
       end
     end
   end

@@ -2,7 +2,7 @@ source 'https://rubygems.org'
 
 gemspec
 
-gem 'rspec'
+gem 'rspec-rails'
 gem 'simplecov'
 gem 'activerecord'
 gem 'sqlite3'
